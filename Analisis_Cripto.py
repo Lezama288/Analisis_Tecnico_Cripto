@@ -47,7 +47,8 @@ if st.button("🚀 Ejecutar Análisis de Mercado"):
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             rsi = (100 - (100 / (1 + (gain / loss)))).iloc[-1]
             
-            tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift()], axis=1).max(axis=1)
+            # Línea corregida con los paréntesis correctos
+            tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
             atr = tr.rolling(window=14).mean().iloc[-1]
             
             current_price = close.iloc[-1]
