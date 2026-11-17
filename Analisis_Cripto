@@ -1,0 +1,150 @@
+import requests
+import pandas as pd
+import numpy as np
+
+# --- CONFIGURACIÓN DE TELEGRAM ---
+TELEGRAM_TOKEN = "TU_TOKEN_DE_BOT_AQUI"  # Reemplaza con tu token de BotFather
+CHAT_ID = "TU_CHAT_ID_AQUI"              # Reemplaza con tu ID numérico de Telegram
+
+# --- CONFIGURACIÓN DEL MERCADO ---
+SYMBOL = "BTC-USDT"  # Puedes cambiarlo por ETH-USDT, SOL-USDT, etc.
+TIMEFRAME = "4H"     # Temporalidad de las velas (4H o 1D recomendado)
+
+def send_telegram_message(message):
+    """Envía el reporte formateado a tu chat de Telegram."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID, 
+        "text": message, 
+        "parse_mode": "Markdown"
+    }
+    try:
+        response = requests.post(url, json=payload)
+        if response.status_code != 200:
+            print(f"Error al enviar a Telegram: {response.text}")
+    except Exception as e:
+        print(f"Error de conexión con Telegram: {e}")
+
+def get_okx_candles(inst_id, bar="4H", limit=150):
+    """Obtiene las velas históricas (K-line) desde la API pública de OKX sin necesidad de API Keys."""
+    url = f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
+    response = requests.get(url)
+    data = response.json()
+    
+    if data["code"] == "0":
+        raw_candles = data["data"]
+        # OKX devuelve del más reciente al más antiguo; invertimos para orden cronológico
+        df = pd.DataFrame(raw_candles, columns=["ts", "o", "high", "low", "c", "vol", "volCcy", "volCcyQuote", "confirm"])
+        df = df.iloc[::-1].reset_index(drop=True)
+        for col in ["o", "high", "low", "c", "vol"]:
+            df[col] = pd.to_numeric(df[col])
+        return df
+    else:
+        raise Exception(f"Error al obtener datos de OKX: {data['msg']}")
+
+def calculate_indicators(df):
+    """Calcula las Medias Móviles (EMA), el RSI y el ATR."""
+    close = df["c"]
+    high = df["high"]
+    low = df["low"]
+    
+    # 1. Medias Móviles Exponenciales (EMA 50 y EMA 200)
+    df["EMA_50"] = close.ewm(span=50, adjust=False).mean()
+    df["EMA_200"] = close.ewm(span=200, adjust=False).mean()
+    
+    # 2. RSI (14 periodos)
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df["RSI"] = 100 - (100 / (1 + rs))
+    
+    # 3. ATR (Average True Range para medir volatilidad y Stop Loss)
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["ATR"] = tr.rolling(window=14).mean()
+    
+    return df
+
+def analyze_and_format_report(df, symbol):
+    """Evalúa la tendencia y genera el mensaje estructurado para Telegram."""
+    current_price = df["c"].iloc[-1]
+    ema_50 = df["EMA_50"].iloc[-1]
+    ema_200 = df["EMA_200"].iloc[-1]
+    rsi = df["RSI"].iloc[-1]
+    atr = df["ATR"].iloc[-1]
+    recent_low = df["low"].iloc[-10:].min()   # Soporte estructural reciente
+    recent_high = df["high"].iloc[-10:].max() # Resistencia estructural reciente
+    
+    score = 0
+    reasons = []
+    
+    if current_price > ema_50:
+        score += 1
+        reasons.append("• Precio sobre EMA 50 (Corto plazo alcista)")
+    else:
+        score -= 1
+        reasons.append("• Precio bajo EMA 50 (Corto plazo bajista)")
+        
+    if ema_50 > ema_200:
+        score += 2
+        reasons.append("• EMA 50 sobre EMA 200 (Tendencia estructural alcista)")
+    else:
+        score -= 2
+        reasons.append("• EMA 50 bajo EMA 200 (Tendencia estructural bajista)")
+        
+    if 40 <= rsi <= 60:
+        reasons.append(f"• RSI en zona neutral ({rsi:.1f})")
+    elif rsi > 70:
+        score -= 1
+        reasons.append(f"• RSI en sobrecompra ({rsi:.1f})")
+    elif rsi < 30:
+        score += 1
+        reasons.append(f"• RSI en sobreventa ({rsi:.1f})")
+
+    # Definir sesgo de probabilidad y niveles operativos
+    if score > 0:
+        bias = "🟢 *ALCISTA (Mayor probabilidad de Subida)*"
+        entry_limit = round(recent_low + (atr * 0.3), 2)
+        stop_loss = round(entry_limit - (atr * 1.5), 2)
+        risk = entry_limit - stop_loss
+        take_profit = round(entry_limit + (risk * 2.5), 2)
+    else:
+        bias = "🔴 *BAJISTA (Mayor probabilidad de Bajada)*"
+        entry_limit = round(recent_high - (atr * 0.3), 2)
+        stop_loss = round(entry_limit + (atr * 1.5), 2)
+        risk = stop_loss - entry_limit
+        take_profit = round(entry_limit - (risk * 2.5), 2)
+
+    # Construir mensaje en formato Markdown para Telegram
+    report = f"""
+🤖 *REPORTE TÉCNICO AUTOMATIZADO*
+📊 *Par:* `{symbol}` | *Temporalidad:* `{TIMEFRAME}`
+
+💰 *Precio Actual:* `${current_price:,.2f}`
+📈 *Sesgo de Probabilidad:* {bias}
+
+🔍 *Factores Técnicos:*
+{chr(10).join(reasons)}
+
+🎯 *NIVELES SUGERIDOS (PARA PRUEBAS):*
+🔹 *Entrada (Limit):* `${entry_limit:,.2f}`
+🛡️ *Stop Loss (SL):* `${stop_loss:,.2f}`
+🏆 *Take Profit (TP):* `${take_profit:,.2f}`
+"""
+    return report
+
+if __name__ == "__main__":
+    print(f"Analizando {symbol} en OKX...")
+    try:
+        candles_df = get_okx_candles(SYMBOL, bar=TIMEFRAME, limit=150)
+        df_indicators = calculate_indicators(candles_df)
+        message = analyze_and_format_report(df_indicators, SYMBOL)
+        
+        # Enviar el reporte a Telegram
+        send_telegram_message(message)
+        print("¡Análisis completado y enviado con éxito a tu Telegram!")
+    except Exception as e:
+        print(f"Ocurrió un error durante la ejecución: {e}")
