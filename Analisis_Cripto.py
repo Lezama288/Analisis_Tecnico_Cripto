@@ -1,44 +1,54 @@
 import streamlit as st
 import requests
 import pandas as pd
+import ccxt
 
 # Configuración de la página
-st.set_page_config(page_title="Bot de Análisis de Futuros OKX", page_icon="📈", layout="centered")
+st.set_page_config(page_title="Bot de Trading Automático OKX", page_icon="📈", layout="centered")
 
-st.title("🤖 Bot de Análisis Técnico para Futuros OKX")
-st.markdown("Herramienta analítica con buscador para evaluar el sesgo de mercado y niveles operativos (Limit, SL, TP).")
+st.title("🤖 Bot de Análisis y Ejecución Automática en OKX")
+st.markdown("Herramienta avanzada para evaluar el sesgo de mercado, calcular niveles y **ejecutar órdenes reales o en modo demo**.")
 
-# Función para obtener dinámicamente TODOS los futuros / swaps en USDT de OKX
+# --- BARRA LATERAL: CREDENCIALES Y CONFIGURACIÓN ---
+st.sidebar.header("🔑 Credenciales API de OKX")
+api_key = st.sidebar.text_input("API Key", type="password")
+secret_key = st.sidebar.text_input("Secret Key", type="password")
+password = st.sidebar.text_input("Passphrase", type="password")
+
+use_testnet = st.sidebar.checkbox("Activar Modo Demo / Testnet", value=True)
+execute_trade_auto = st.sidebar.checkbox("⚠️ Habilitar Ejecución Automática de Órdenes", value=False)
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ Configuración de Riesgo")
+capital_to_risk = st.sidebar.number_input("Capital a arriesgar por operación (USDT)", value=10.0, min_value=1.0)
+
+# Función para obtener dinámicamente los futuros / swaps en USDT de OKX con respaldo seguro
 @st.cache_data(ttl=3600)
 def get_okx_futures_symbols():
     url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=5)
         data = response.json()
-        if data["code"] == "0":
-            # Filtrar contratos cuyo margen/cotización sea en USDT (ej: BTC-USDT-SWAP)
-            symbols = [item["instId"] for item in data["data"] if item.get("quoteCcy") == "USDT"]
-            return sorted(symbols)
+        if data.get("code") == "0":
+            symbols = [item["instId"] for item in data.get("data", []) if item.get("quoteCcy") == "USDT"]
+            if symbols:
+                return sorted(symbols)
     except Exception:
         pass
-    # Lista de respaldo por si falla la conexión inicial
-    return ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP"]
+    
+    # Lista de respaldo robusta en caso de que la API falle o no devuelva datos
+    return sorted([
+        "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP",
+        "BNB-USDT-SWAP", "DOGE-USDT-SWAP", "ADA-USDT-SWAP", "AVAX-USDT-SWAP",
+        "LINK-USDT-SWAP", "SUI-USDT-SWAP", "PEPE-USDT-SWAP", "SHIB-USDT-SWAP",
+        "NEAR-USDT-SWAP", "MATIC-USDT-SWAP", "DOT-USDT-SWAP", "LTC-USDT-SWAP"
+    ])
 
-# Cargar la lista de criptomonedas a futuro disponibles
 all_symbols = get_okx_futures_symbols()
 
-# Barra lateral para configuraciones del usuario con buscador integrado
-st.sidebar.header("Configuración de Mercado")
-
-# Streamlit selectbox permite escribir directamente para buscar en la lista
+st.sidebar.header("Mercado")
 default_index = all_symbols.index("BTC-USDT-SWAP") if "BTC-USDT-SWAP" in all_symbols else 0
-symbol = st.sidebar.selectbox(
-    "🔍 Escribe o selecciona la Criptomoneda", 
-    all_symbols, 
-    index=default_index,
-    help="Puedes escribir directamente el nombre (ej: DOGE, ADA, BTC) para buscar el par a futuro."
-)
-
+symbol = st.sidebar.selectbox("🔍 Criptomoneda (Futuros)", all_symbols, index=default_index, help="Escribe para buscar cualquier cripto")
 timeframe = st.sidebar.selectbox("Temporalidad", ["1H", "4H", "1D"], index=1)
 
 # Función para obtener velas históricas de OKX
@@ -47,7 +57,7 @@ def get_okx_candles(inst_id, bar, limit=150):
     url = f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
     response = requests.get(url)
     data = response.json()
-    if data["code"] == "0":
+    if data.get("code") == "0":
         df = pd.DataFrame(data["data"], columns=["ts", "o", "high", "low", "c", "vol", "volCcy", "volCcyQuote", "confirm"])
         df = df.iloc[::-1].reset_index(drop=True)
         for col in ["o", "high", "low", "c", "vol"]:
@@ -57,8 +67,38 @@ def get_okx_candles(inst_id, bar, limit=150):
         st.error("Error al conectar con la API de OKX para este símbolo.")
         return None
 
-# Botón para ejecutar el análisis
-if st.button("🚀 Ejecutar Análisis de Futuros"):
+# Función para ejecutar la orden en OKX usando CCXT
+def execute_order_on_okx(symbol, side, entry_price, stop_loss, take_profit, amount_usdt, api_key, secret_key, password, testnet):
+    try:
+        exchange = ccxt.okx({
+            'apiKey': api_key,
+            'secret': secret_key,
+            'password': password,
+            'enableRateLimit': True,
+        })
+        
+        if testnet:
+            exchange.set_sandbox_mode(True)
+            
+        amount = round(amount_usdt / entry_price, 4)
+        if amount <= 0:
+            amount = 1.0
+
+        order = exchange.create_order(
+            symbol=symbol,
+            type='limit',
+            side=side,
+            amount=amount,
+            price=entry_price
+        )
+        
+        st.success(f"✅ ¡Orden Limit ejecutada con éxito en OKX! ID: {order['id']}")
+        
+    except Exception as e:
+        st.error(f"❌ Error al conectar o ejecutar en OKX: {str(e)}")
+
+# Botón para ejecutar el análisis y opcionalmente el trade
+if st.button("🚀 Ejecutar Análisis y Evaluar Operativa"):
     with st.spinner(f"Analizando {symbol} en temporalidad {timeframe}..."):
         df = get_okx_candles(symbol, timeframe)
         
@@ -67,7 +107,6 @@ if st.button("🚀 Ejecutar Análisis de Futuros"):
             high = df["high"]
             low = df["low"]
             
-            # Cálculos técnicos
             ema_50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
             ema_200 = close.ewm(span=200, adjust=False).mean().iloc[-1]
             
@@ -83,7 +122,6 @@ if st.button("🚀 Ejecutar Análisis de Futuros"):
             recent_low = low.iloc[-10:].min()
             recent_high = high.iloc[-10:].max()
             
-            # Sistema de puntuación para sesgo de probabilidad
             score = 0
             if current_price > ema_50: score += 1
             if ema_50 > ema_200: score += 2
@@ -92,18 +130,19 @@ if st.button("🚀 Ejecutar Análisis de Futuros"):
             
             if score > 0:
                 bias = "ALCISTA (Mayor probabilidad de Subida)"
+                side = "buy"
                 entry_limit = round(recent_low + (atr * 0.3), 4)
                 stop_loss = round(entry_limit - (atr * 1.5), 4)
                 take_profit = round(entry_limit + ((entry_limit - stop_loss) * 2.5), 4)
                 color = "green"
             else:
                 bias = "BAJISTA (Mayor probabilidad de Bajada)"
+                side = "sell"
                 entry_limit = round(recent_high - (atr * 0.3), 4)
                 stop_loss = round(entry_limit + (atr * 1.5), 4)
                 take_profit = round(entry_limit - ((stop_loss - entry_limit) * 2.5), 4)
                 color = "red"
             
-            # Mostrar métricas en la interfaz
             st.metric("Precio Actual del Futuro", f"${current_price:,.4f}")
             st.markdown(f"### Sesgo: :{color}[{bias}]")
             
@@ -112,5 +151,22 @@ if st.button("🚀 Ejecutar Análisis de Futuros"):
             col2.metric("Stop Loss (SL)", f"${stop_loss:,.4f}")
             col3.metric("Take Profit (TP)", f"${take_profit:,.4f}")
             
-            # Gráfico de la evolución del precio
             st.line_chart(df.set_index(pd.to_datetime(df["ts"], unit="ms"))["c"])
+            
+            if execute_trade_auto:
+                if not api_key or not secret_key or not password:
+                    st.warning("⚠️ Has activado la ejecución automática, pero faltan tus credenciales API de OKX en la barra lateral.")
+                else:
+                    st.info("🔄 Enviando orden automática a OKX...")
+                    execute_order_on_okx(
+                        symbol=symbol,
+                        side=side,
+                        entry_price=entry_limit,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                        amount_usdt=capital_to_risk,
+                        api_key=api_key,
+                        secret_key=secret_key,
+                        password=password,
+                        testnet=use_testnet
+                    )
