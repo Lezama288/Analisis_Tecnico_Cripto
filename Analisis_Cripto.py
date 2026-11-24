@@ -513,10 +513,4 @@ if btn_escanear:
             )
 
         if destacados:
-            if activar_telegram and tg_token and tg_chat_id:
-                alertas_enviadas = 0
-                for r in destacados:
-                    if "BTC" not in r["Cripto"] and r["Prob_Subir_Num"] >= umbral_alerta:
-                        msg = (
-                            f"🚨 *ALERTA INSTITUCIONAL (OKX)*\n\n"
-                            f"🪙 *Activo:* {r['Cripto']}\n"
+            if activar_telegram and tg_token and tg_chat
