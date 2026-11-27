@@ -6,7 +6,30 @@ import pandas as pd
 st.set_page_config(page_title="Bot de Análisis Técnico OKX", page_icon="📈", layout="wide")
 
 st.title("🤖 Bot de Análisis Técnico para OKX (Futuros y Spot)")
-st.markdown("Herramienta analítica con buscador escrito para evaluar **Spot** y **Futuros (SWAP)** por separado.")
+st.markdown("Herramienta analítica con buscador escrito para evaluar **Spot** y **Futuros (SWAP)** por separado, con viñetas explicativas en cada dato.")
+
+# Diccionario de explicaciones para las viñetas de cada información
+EXPLICACIONES = {
+    "precio_actual": "Último precio de cierre de la vela más reciente en el mercado seleccionado.",
+    "diferencia_basis": "Diferencia entre el precio de Futuros (SWAP) y Spot. Un valor positivo indica que Futuros cotiza por encima de Spot (prima/contango); negativo indica descuento.",
+    "sesgo": "Dirección probable según la puntuación combinada de medias móviles (EMA 50/200) y momentum (RSI 14).",
+    "score": "Suma de puntos técnicos: +1 si precio > EMA 50, +2 si EMA 50 > EMA 200, +1 si RSI < umbral de sobreventa y -1 si RSI > umbral de sobrecompra.",
+    "entrada_limit": "Nivel sugerido de orden límite calculado desde el mínimo reciente (en sesgo alcista) o máximo reciente (en sesgo bajista) ajustado con el multiplicador de entrada por ATR.",
+    "stop_loss": "Nivel de invalidación/protección calculado alejando la entrada según el multiplicador de Stop Loss por ATR para limitar pérdidas.",
+    "take_profit": "Objetivo de toma de ganancias calculado proyectando la distancia del riesgo (Entrada - SL) multiplicada por el ratio/multiplicador de Take Profit.",
+    "ema_50": "Media Móvil Exponencial de 50 periodos: refleja la tendencia de corto/medio plazo dando más peso a las velas recientes.",
+    "ema_200": "Media Móvil Exponencial de 200 periodos: referencia clásica de tendencia macro o de fondo en la temporalidad elegida.",
+    "rsi_14": "Índice de Fuerza Relativa de 14 periodos (0 a 100): mide velocidad y cambio de movimientos para detectar zonas extremas o impulso.",
+    "atr_14": "Average True Range de 14 periodos: mide la volatilidad promedio por vela (en unidades de precio) para dimensionar entradas, SL y TP.",
+    "tabla_resumen": "Compara en una sola vista el estado de Spot y Futuros (SWAP): precio, sesgo, score, niveles operativos (Limit, SL, TP) e indicadores.",
+}
+
+
+def viñeta_explicacion(clave: str, etiqueta_boton: str = "ℹ️"):
+    """Muestra una viñeta interactiva con la explicación del dato."""
+    texto = EXPLICACIONES.get(clave, "Sin explicación disponible.")
+    with st.popover(etiqueta_boton):
+        st.caption(texto)
 
 
 # Función para obtener TODOS los instrumentos (Swaps y Spot en USDT) de OKX
@@ -83,7 +106,7 @@ def get_okx_candles(inst_id, bar, limit=150):
     return None
 
 
-def calcular_analisis(df: pd.DataFrame) -> dict:
+def calcular_analisis(df: pd.DataFrame, cfg: dict) -> dict:
     close = df["c"]
     high = df["high"]
     low = df["low"]
@@ -109,31 +132,37 @@ def calcular_analisis(df: pd.DataFrame) -> dict:
     recent_low = float(low.iloc[-10:].min())
     recent_high = float(high.iloc[-10:].max())
 
-    # Puntuación para determinar sesgo
+    # Puntuación configurable para determinar sesgo
     score = 0
     if current_price > ema_50:
-        score += 1
+        score += cfg["peso_ema50"]
     if ema_50 > ema_200:
-        score += 2
-    if rsi < 30:
-        score += 1
-    elif rsi > 70:
-        score -= 1
+        score += cfg["peso_ema200"]
+    if rsi < cfg["rsi_oversold"]:
+        score += cfg["peso_rsi"]
+    elif rsi > cfg["rsi_overbought"]:
+        score -= cfg["peso_rsi"]
 
     if score > 0:
         bias_corto = "ALCISTA"
         bias = "ALCISTA (Mayor probabilidad de Subida)"
-        entry_limit = round(recent_low + (atr * 0.3), 6)
-        stop_loss = round(entry_limit - (atr * 1.5), 6)
-        take_profit = round(entry_limit + ((entry_limit - stop_loss) * 2.5), 6)
+        raw_entry = recent_low + (atr * cfg["mult_entry"])
+        raw_sl = raw_entry - (atr * cfg["mult_sl"])
+        raw_tp = raw_entry + ((raw_entry - max(0.0, raw_sl)) * cfg["mult_tp"])
         color = "green"
     else:
         bias_corto = "BAJISTA"
         bias = "BAJISTA (Mayor probabilidad de Bajada)"
-        entry_limit = round(recent_high - (atr * 0.3), 6)
-        stop_loss = round(entry_limit + (atr * 1.5), 6)
-        take_profit = round(entry_limit - ((stop_loss - entry_limit) * 2.5), 6)
+        raw_entry = recent_high - (atr * cfg["mult_entry"])
+        raw_sl = raw_entry + (atr * cfg["mult_sl"])
+        raw_tp = raw_entry - ((max(0.0, raw_sl) - max(0.0, raw_entry)) * cfg["mult_tp"])
         color = "red"
+
+    # Evitar precios en cero o negativos en activos de precio muy bajo
+    alerta_cero = (raw_entry <= 0) or (raw_sl <= 0) or (raw_tp <= 0)
+    entry_limit = round(max(0.0, raw_entry), 6)
+    stop_loss = round(max(0.0, raw_sl), 6)
+    take_profit = round(max(0.0, raw_tp), 6)
 
     return {
         "current_price": current_price,
@@ -147,11 +176,12 @@ def calcular_analisis(df: pd.DataFrame) -> dict:
         "entry_limit": entry_limit,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
+        "alerta_cero": alerta_cero,
         "color": color,
     }
 
 
-def construir_tabla_resumen(spot_pair: str, df_spot: pd.DataFrame | None, swap_pair: str, df_swap: pd.DataFrame | None) -> pd.DataFrame:
+def construir_tabla_resumen(spot_pair: str, df_spot: pd.DataFrame | None, swap_pair: str, df_swap: pd.DataFrame | None, cfg: dict) -> pd.DataFrame:
     filas = []
 
     for mercado, inst_id, df in [
@@ -159,7 +189,7 @@ def construir_tabla_resumen(spot_pair: str, df_spot: pd.DataFrame | None, swap_p
         ("Futuros (SWAP)", swap_pair, df_swap),
     ]:
         if df is not None and not df.empty:
-            res = calcular_analisis(df)
+            res = calcular_analisis(df, cfg)
             filas.append({
                 "Mercado": mercado,
                 "Par": inst_id,
@@ -193,28 +223,62 @@ def construir_tabla_resumen(spot_pair: str, df_spot: pd.DataFrame | None, swap_p
     return pd.DataFrame(filas)
 
 
-def render_resultado_mercado(titulo_mercado: str, inst_id: str, df: pd.DataFrame | None):
+def render_resultado_mercado(titulo_mercado: str, inst_id: str, df: pd.DataFrame | None, cfg: dict):
     st.subheader(f"{titulo_mercado} — `{inst_id}`")
 
     if df is None or df.empty:
         st.warning(f"No se encontraron datos de velas para `{inst_id}` en OKX.")
         return
 
-    res = calcular_analisis(df)
+    res = calcular_analisis(df, cfg)
 
-    st.metric("Precio Actual", fmt_precio(res["current_price"]))
-    st.markdown(f"**Sesgo:** :{res['color']}[{res['bias']}] (Score: `{res['score']}`)")
+    if res["alerta_cero"]:
+        st.warning(
+            "Uno o más niveles calculados (Limit, SL o TP) llegaron a 0 o menos por el multiplicador de ATR en un activo de precio bajo; se ajustaron a $0 para evitar valores negativos."
+        )
 
+    # Precio actual + viñeta
+    p_col, p_pop = st.columns([5, 1])
+    with p_col:
+        st.metric("Precio Actual", fmt_precio(res["current_price"]))
+    with p_pop:
+        st.write("")
+        viñeta_explicacion("precio_actual")
+
+    # Sesgo y Score + viñetas
+    s_col, s_pop1, s_pop2 = st.columns([6, 1, 1])
+    with s_col:
+        st.markdown(f"**Sesgo:** :{res['color']}[{res['bias']}] | **Score:** `{res['score']}`")
+    with s_pop1:
+        viñeta_explicacion("sesgo", "ℹ️ Sesgo")
+    with s_pop2:
+        viñeta_explicacion("score", "ℹ️ Score")
+
+    # Niveles operativos (Limit, SL, TP) + viñeta por cada uno
     c1, c2, c3 = st.columns(3)
-    c1.metric("Entrada (Limit)", fmt_precio(res["entry_limit"]))
-    c2.metric("Stop Loss (SL)", fmt_precio(res["stop_loss"]))
-    c3.metric("Take Profit (TP)", fmt_precio(res["take_profit"]))
+    with c1:
+        st.metric("Entrada (Limit)", fmt_precio(res["entry_limit"]))
+        viñeta_explicacion("entrada_limit", "ℹ️ Qué es Limit")
+    with c2:
+        st.metric("Stop Loss (SL)", fmt_precio(res["stop_loss"]))
+        viñeta_explicacion("stop_loss", "ℹ️ Qué es SL")
+    with c3:
+        st.metric("Take Profit (TP)", fmt_precio(res["take_profit"]))
+        viñeta_explicacion("take_profit", "ℹ️ Qué es TP")
 
-    with st.expander("Ver indicadores técnicos (EMA, RSI, ATR)"):
-        st.write(f"- **EMA 50:** `{res['ema_50']:.6f}`")
-        st.write(f"- **EMA 200:** `{res['ema_200']:.6f}`")
-        st.write(f"- **RSI (14):** `{res['rsi']:.2f}`")
-        st.write(f"- **ATR (14):** `{res['atr']:.6f}`")
+    # Indicadores técnicos con viñeta individual para cada uno
+    with st.expander("Ver indicadores técnicos (EMA, RSI, ATR) con explicación"):
+        for etiqueta, valor_txt, clave_exp in [
+            ("EMA 50", f"`{res['ema_50']:.6f}`", "ema_50"),
+            ("EMA 200", f"`{res['ema_200']:.6f}`", "ema_200"),
+            ("RSI (14)", f"`{res['rsi']:.2f}`", "rsi_14"),
+            ("ATR (14)", f"`{res['atr']:.6f}`", "atr_14"),
+        ]:
+            i_col, i_pop = st.columns([6, 1])
+            with i_col:
+                st.write(f"- **{etiqueta}:** {valor_txt}")
+            with i_pop:
+                viñeta_explicacion(clave_exp)
 
     # Gráfico protegido
     try:
@@ -249,6 +313,27 @@ selected_symbol = st.sidebar.selectbox(
 timeframe = st.sidebar.selectbox("Temporalidad", ["1H", "4H", "1D"], index=1)
 vista_modo = st.sidebar.radio("Modo de visualización", ["Pestañas separadas", "Dos columnas lado a lado"])
 
+with st.sidebar.expander("⚙️ Ajustes de Cálculo (ATR y Sesgo)"):
+    mult_entry = st.slider("Multiplicador Entrada (ATR)", 0.0, 2.0, 0.3, 0.1)
+    mult_sl = st.slider("Multiplicador Stop Loss (ATR)", 0.5, 5.0, 1.5, 0.1)
+    mult_tp = st.slider("Multiplicador Take Profit (R)", 1.0, 6.0, 2.5, 0.1)
+    peso_ema50 = st.number_input("Peso Precio > EMA 50", 0, 5, 1)
+    peso_ema200 = st.number_input("Peso EMA 50 > EMA 200", 0, 5, 2)
+    peso_rsi = st.number_input("Peso RSI extremo", 0, 5, 1)
+    rsi_oversold = st.slider("Umbral RSI Sobreventa (<)", 10, 45, 30, 1)
+    rsi_overbought = st.slider("Umbral RSI Sobrecompra (>)", 55, 90, 70, 1)
+
+cfg = {
+    "mult_entry": mult_entry,
+    "mult_sl": mult_sl,
+    "mult_tp": mult_tp,
+    "peso_ema50": peso_ema50,
+    "peso_ema200": peso_ema200,
+    "peso_rsi": peso_rsi,
+    "rsi_oversold": rsi_oversold,
+    "rsi_overbought": rsi_overbought,
+}
+
 base_asset = extraer_base_asset(
     selected_symbol if busqueda_mayus == "" else (busqueda_mayus if "-" not in busqueda_mayus else selected_symbol)
 )
@@ -270,16 +355,42 @@ if st.button("🚀 Ejecutar Análisis Técnico (Spot y Futuros)"):
         precio_swap = float(df_swap["c"].iloc[-1])
         diff_abs = precio_swap - precio_spot
         diff_pct = ((precio_swap - precio_spot) / precio_spot) * 100 if precio_spot else 0
-        st.info(
-            f"**Comparativa rápida {base_asset}/USDT ({timeframe}):** "
-            f"Spot: `{fmt_precio(precio_spot)}` | Futuros: `{fmt_precio(precio_swap)}` | "
-            f"Diferencia (Futuros - Spot): `{diff_abs:+,.6f}` (`{diff_pct:+.2f}%`)"
-        )
+        c_info, c_pop = st.columns([11, 1])
+        with c_info:
+            st.info(
+                f"**Comparativa rápida {base_asset}/USDT ({timeframe}):** "
+                f"Spot: `{fmt_precio(precio_spot)}` | Futuros: `{fmt_precio(precio_swap)}` | "
+                f"Diferencia (Futuros - Spot): `{diff_abs:+,.6f}` (`{diff_pct:+.2f}%`)"
+            )
+        with c_pop:
+            st.write("")
+            viñeta_explicacion("diferencia_basis")
 
-    # Tabla resumen comparativa
-    st.markdown(f"### 📋 Tabla Resumen — {base_asset}/USDT ({timeframe})")
-    df_resumen = construir_tabla_resumen(spot_pair, df_spot, swap_pair, df_swap)
+    # Tabla resumen comparativa con viñeta explicativa y glosario de columnas
+    t_col, t_pop = st.columns([11, 1])
+    with t_col:
+        st.markdown(f"### 📋 Tabla Resumen — {base_asset}/USDT ({timeframe})")
+    with t_pop:
+        st.write("")
+        viñeta_explicacion("tabla_resumen")
+
+    df_resumen = construir_tabla_resumen(spot_pair, df_spot, swap_pair, df_swap, cfg)
     st.dataframe(df_resumen, use_container_width=True, hide_index=True)
+
+    with st.popover("ℹ️ Explicación de cada columna de la tabla resumen"):
+        for col_name, clave_exp in [
+            ("Precio Actual", "precio_actual"),
+            ("Sesgo", "sesgo"),
+            ("Score", "score"),
+            ("Entrada (Limit)", "entrada_limit"),
+            ("Stop Loss (SL)", "stop_loss"),
+            ("Take Profit (TP)", "take_profit"),
+            ("RSI (14)", "rsi_14"),
+            ("EMA 50", "ema_50"),
+            ("EMA 200", "ema_200"),
+            ("ATR (14)", "atr_14"),
+        ]:
+            st.markdown(f"- **{col_name}:** {EXPLICACIONES[clave_exp]}")
 
     st.divider()
 
@@ -287,12 +398,12 @@ if st.button("🚀 Ejecutar Análisis Técnico (Spot y Futuros)"):
     if vista_modo == "Pestañas separadas":
         tab_spot, tab_swap = st.tabs([f"🟢 SPOT ({spot_pair})", f"🟣 FUTUROS / SWAP ({swap_pair})"])
         with tab_spot:
-            render_resultado_mercado("Mercado Spot", spot_pair, df_spot)
+            render_resultado_mercado("Mercado Spot", spot_pair, df_spot, cfg)
         with tab_swap:
-            render_resultado_mercado("Mercado Futuros (Perpetuo SWAP)", swap_pair, df_swap)
+            render_resultado_mercado("Mercado Futuros (Perpetuo SWAP)", swap_pair, df_swap, cfg)
     else:
         col_left, col_right = st.columns(2)
         with col_left:
-            render_resultado_mercado("🟢 Mercado Spot", spot_pair, df_spot)
+            render_resultado_mercado("🟢 Mercado Spot", spot_pair, df_spot, cfg)
         with col_right:
-            render_resultado_mercado("🟣 Mercado Futuros (SWAP)", swap_pair, df_swap)
+            render_resultado_mercado("🟣 Mercado Futuros (SWAP)", swap_pair, df_swap, cfg)
